@@ -1,0 +1,74 @@
+{
+  "title": "Tailscale Trust",
+  "config": {
+    "abort": {
+      "already_configured": "This tailnet is already configured"
+    },
+    "error": {
+      "cannot_connect": "Failed to connect to Tailscale",
+      "insufficient_scope": "The OAuth client must have devices:core:read access",
+      "invalid_auth": "The OAuth client ID or secret is invalid or revoked"
+    },
+    "step": {
+      "user": {
+        "title": "Connect a Tailscale tailnet",
+        "description": "Create a read-only OAuth client on the [Trust credentials page]({trust_credentials_url}) with only **Devices > Core: Read** (`devices:core:read`).",
+        "data": {
+          "tailnet": "Tailnet identifier",
+          "client_id": "OAuth client ID",
+          "client_secret": "OAuth client secret"
+        },
+        "data_description": {
+          "tailnet": "The tailnet DNS name, organization name, or `-` shorthand."
+        }
+      },
+      "reauth_confirm": {
+        "title": "Reconnect Tailscale Trust",
+        "description": "The credential for `{tailnet}` was rejected. Create or select a read-only OAuth client on the [Trust credentials page]({trust_credentials_url}) and enter the replacement credentials.",
+        "data": {
+          "client_id": "OAuth client ID",
+          "client_secret": "OAuth client secret"
+        }
+      }
+    }
+  },
+  "entity": {
+    "binary_sensor": {
+      "online": {
+        "name": "Online"
+      },
+      "client": {
+        "name": "Client update available"
+      },
+      "key_expiry_disabled": {
+        "name": "Key expiry disabled"
+      },
+      "client_supports_ipv6": {
+        "name": "Client supports IPv6"
+      },
+      "client_supports_pcp": {
+        "name": "Client supports PCP"
+      },
+      "client_supports_pmp": {
+        "name": "Client supports PMP"
+      },
+      "client_supports_udp": {
+        "name": "Client supports UDP"
+      },
+      "client_supports_upnp": {
+        "name": "Client supports UPnP"
+      }
+    },
+    "sensor": {
+      "expires": {
+        "name": "Key expiration"
+      },
+      "ip": {
+        "name": "Tailscale IP"
+      },
+      "last_seen": {
+        "name": "Last seen"
+      }
+    }
+  }
+}
