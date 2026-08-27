@@ -1,0 +1,11 @@
+{
+  "domain": "tailscale_trust",
+  "name": "Tailscale Trust",
+  "codeowners": ["@burren2025"],
+  "config_flow": true,
+  "documentation": "https://github.com/burren2025/HATailscaleTrust",
+  "integration_type": "hub",
+  "iot_class": "cloud_polling",
+  "issue_tracker": "https://github.com/burren2025/HATailscaleTrust/issues",
+  "version": "0.1.0"
+}
