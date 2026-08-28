@@ -235,7 +235,7 @@ this integration deliberately prefers `nodeId`.
 
 ## Development
 
-Use Python 3.13 or newer:
+Use Python 3.14.2 or newer (required by the pinned Home Assistant test version):
 
 ```shell
 python -m venv .venv
