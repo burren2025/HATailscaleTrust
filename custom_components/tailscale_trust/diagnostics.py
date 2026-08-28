@@ -27,6 +27,10 @@ async def async_get_config_entry_diagnostics(
                 "present": device.present,
                 "online": device.online,
                 "online_source": device.online_source,
+                "routes_available": device.routes_available,
+                "advertised_routes": device.advertised_routes,
+                "enabled_routes": device.enabled_routes,
+                "routes_awaiting_approval": device.routes_awaiting_approval,
             }
             for node_id, device in entry.runtime_data.data.items()
         },

@@ -9,9 +9,12 @@ CONF_TAILNET = "tailnet"
 CONF_CLIENT_ID = "client_id"
 CONF_CLIENT_SECRET = "client_secret"
 
-OAUTH_SCOPE = "devices:core:read"
+OAUTH_SCOPES = ("devices:core:read", "devices:routes:read")
+OAUTH_SCOPE = " ".join(OAUTH_SCOPES)
 OAUTH_TOKEN_URL = "https://api.tailscale.com/api/v2/oauth/token"
 API_BASE_URL = "https://api.tailscale.com/api/v2"
+
+EXIT_NODE_ROUTES = frozenset({"0.0.0.0/0", "::/0"})
 
 SCAN_INTERVAL = timedelta(minutes=1)
 TOKEN_REFRESH_SKEW = 60

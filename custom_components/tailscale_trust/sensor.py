@@ -5,7 +5,7 @@ from __future__ import annotations
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime
-from typing import override
+from typing import Any, override
 
 from homeassistant.components.sensor import (
     SensorDeviceClass,
@@ -27,7 +27,8 @@ PARALLEL_UPDATES = 0
 class TailscaleTrustSensorEntityDescription(SensorEntityDescription):
     """Describe a Tailscale Trust sensor."""
 
-    value_fn: Callable[[TailscaleDevice], datetime | str | None]
+    value_fn: Callable[[TailscaleDevice], datetime | str | int | None]
+    routes_fn: Callable[[TailscaleDevice], tuple[str, ...]] | None = None
 
 
 SENSORS: tuple[TailscaleTrustSensorEntityDescription, ...] = (
@@ -49,6 +50,24 @@ SENSORS: tuple[TailscaleTrustSensorEntityDescription, ...] = (
         translation_key="last_seen",
         device_class=SensorDeviceClass.TIMESTAMP,
         value_fn=lambda device: device.last_seen,
+    ),
+    TailscaleTrustSensorEntityDescription(
+        key="advertised_routes",
+        translation_key="advertised_routes",
+        entity_category=EntityCategory.DIAGNOSTIC,
+        icon="mdi:routes",
+        native_unit_of_measurement="routes",
+        value_fn=lambda device: len(device.advertised_routes),
+        routes_fn=lambda device: device.advertised_routes,
+    ),
+    TailscaleTrustSensorEntityDescription(
+        key="enabled_routes",
+        translation_key="enabled_routes",
+        entity_category=EntityCategory.DIAGNOSTIC,
+        icon="mdi:routes-clock",
+        native_unit_of_measurement="routes",
+        value_fn=lambda device: len(device.enabled_routes),
+        routes_fn=lambda device: device.enabled_routes,
     ),
 )
 
@@ -89,6 +108,22 @@ class TailscaleTrustSensorEntity(TailscaleTrustEntity, SensorEntity):
 
     @property
     @override
-    def native_value(self) -> datetime | str | None:
+    def native_value(self) -> datetime | str | int | None:
         """Return the current sensor value."""
         return self.entity_description.value_fn(self.device)
+
+    @property
+    @override
+    def available(self) -> bool:
+        """Require a successful route response for route sensors."""
+        return super().available and (
+            self.entity_description.routes_fn is None or self.device.routes_available
+        )
+
+    @property
+    @override
+    def extra_state_attributes(self) -> dict[str, Any] | None:
+        """Expose the exact routes without putting them in the sensor state."""
+        if self.entity_description.routes_fn is None:
+            return None
+        return {"routes": list(self.entity_description.routes_fn(self.device))}

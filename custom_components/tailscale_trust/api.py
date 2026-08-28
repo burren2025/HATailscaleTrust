@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 import time
 from collections.abc import Callable, Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from typing import Any, Final
 from urllib.parse import quote
@@ -14,6 +14,7 @@ from aiohttp import ClientError, ClientSession, ClientTimeout
 
 from .const import (
     API_BASE_URL,
+    EXIT_NODE_ROUTES,
     OAUTH_SCOPE,
     OAUTH_TOKEN_URL,
     ONLINE_FALLBACK_WINDOW,
@@ -69,12 +70,36 @@ class TailscaleDevice:
     online: bool | None
     online_source: str
     client_supports: ClientSupports
+    advertised_routes: tuple[str, ...] = ()
+    enabled_routes: tuple[str, ...] = ()
+    routes_available: bool = False
     present: bool = True
 
     @property
     def display_name(self) -> str:
         """Return a concise device name."""
         return (self.name or self.hostname or self.node_id).split(".")[0]
+
+    @property
+    def advertises_exit_node(self) -> bool:
+        """Return whether both default routes are advertised."""
+        return EXIT_NODE_ROUTES.issubset(self.advertised_routes)
+
+    @property
+    def exit_node_enabled(self) -> bool:
+        """Return whether both default routes are enabled."""
+        return EXIT_NODE_ROUTES.issubset(self.enabled_routes)
+
+    @property
+    def advertises_subnet_routes(self) -> bool:
+        """Return whether at least one non-exit route is advertised."""
+        return any(route not in EXIT_NODE_ROUTES for route in self.advertised_routes)
+
+    @property
+    def routes_awaiting_approval(self) -> tuple[str, ...]:
+        """Return advertised routes which are not enabled."""
+        enabled = set(self.enabled_routes)
+        return tuple(route for route in self.advertised_routes if route not in enabled)
 
 
 def _optional_bool(value: Any) -> bool | None:
@@ -85,6 +110,13 @@ def _optional_bool(value: Any) -> bool | None:
 def _optional_string(value: Any) -> str | None:
     """Return a non-empty JSON string."""
     return value if isinstance(value, str) and value else None
+
+
+def _string_tuple(value: Any) -> tuple[str, ...]:
+    """Return a stable tuple containing only non-empty strings."""
+    if not isinstance(value, list):
+        return ()
+    return tuple(item for item in value if isinstance(item, str) and item)
 
 
 def _timestamp(value: Any) -> datetime | None:
@@ -136,9 +168,7 @@ def parse_device(
         legacy_id=legacy_id,
         name=_optional_string(raw.get("name")) or "",
         hostname=_optional_string(raw.get("hostname")) or "",
-        addresses=tuple(item for item in addresses if isinstance(item, str))
-        if isinstance(addresses, list)
-        else (),
+        addresses=_string_tuple(addresses),
         os=_optional_string(raw.get("os")),
         client_version=_optional_string(raw.get("clientVersion")),
         expires=_timestamp(raw.get("expires")),
@@ -224,7 +254,22 @@ class TailscaleTrustClient:
             raise TailscaleTrustConnectionError("OAuth endpoint unavailable") from err
 
         async with response:
-            if response.status in (400, 401):
+            if response.status == 400:
+                try:
+                    error_payload = await response.json()
+                except (ClientError, ValueError, TypeError):
+                    error_payload = None
+                if (
+                    isinstance(error_payload, Mapping)
+                    and error_payload.get("error") == "invalid_scope"
+                ):
+                    raise TailscaleTrustPermissionError(
+                        f"OAuth client must grant {OAUTH_SCOPE}"
+                    )
+                raise TailscaleTrustAuthenticationError(
+                    "OAuth client is invalid or revoked"
+                )
+            if response.status == 401:
                 raise TailscaleTrustAuthenticationError(
                     "OAuth client is invalid or revoked"
                 )
@@ -258,7 +303,7 @@ class TailscaleTrustClient:
         return token
 
     async def async_list_devices(self) -> dict[str, TailscaleDevice]:
-        """List all devices, retrying once with a fresh token after HTTP 401."""
+        """List devices and routes, retrying once after an authentication failure."""
         for attempt in range(2):
             token = await self._async_token(force=attempt == 1)
             status, payload = await self._async_devices_request(token)
@@ -291,7 +336,47 @@ class TailscaleTrustClient:
                 for item in raw_devices
                 if isinstance(item, Mapping)
             )
-            return {device.node_id: device for device in parsed}
+            devices = {device.node_id: device for device in parsed}
+
+            route_results = await asyncio.gather(
+                *(
+                    self._async_routes_request(token, node_id)
+                    for node_id in devices
+                )
+            )
+            if any(status == 401 for _, status, _ in route_results):
+                if attempt == 0:
+                    self.invalidate_token()
+                    continue
+                raise TailscaleTrustAuthenticationError(
+                    "Tailscale rejected refreshed OAuth credentials"
+                )
+
+            for node_id, route_status, route_payload in route_results:
+                if route_status == 403:
+                    raise TailscaleTrustPermissionError(
+                        f"OAuth client must grant {OAUTH_SCOPE} for this tailnet"
+                    )
+                if route_status == 404:
+                    # The device may have been removed between the list and route calls.
+                    continue
+                if route_status >= 400:
+                    raise TailscaleTrustConnectionError(
+                        f"Routes endpoint returned HTTP {route_status}"
+                    )
+                if not isinstance(route_payload, Mapping):
+                    raise TailscaleTrustConnectionError(
+                        "Routes endpoint returned an invalid response"
+                    )
+                devices[node_id] = replace(
+                    devices[node_id],
+                    advertised_routes=_string_tuple(
+                        route_payload.get("advertisedRoutes")
+                    ),
+                    enabled_routes=_string_tuple(route_payload.get("enabledRoutes")),
+                    routes_available=True,
+                )
+            return devices
 
         raise AssertionError("Unreachable authentication retry state")
 
@@ -316,4 +401,28 @@ class TailscaleTrustClient:
             except (ClientError, ValueError, TypeError) as err:
                 raise TailscaleTrustConnectionError(
                     "Devices endpoint returned invalid JSON"
+                ) from err
+
+    async def _async_routes_request(
+        self, token: str, node_id: str
+    ) -> tuple[str, int, Any]:
+        """Perform one authenticated read-only device-routes request."""
+        url = f"{self._api_base_url}/device/{quote(node_id, safe='')}/routes"
+        try:
+            response = await self._session.get(
+                url,
+                headers={"Authorization": f"Bearer {token}"},
+                timeout=REQUEST_TIMEOUT,
+            )
+        except (ClientError, TimeoutError) as err:
+            raise TailscaleTrustConnectionError("Routes endpoint unavailable") from err
+
+        async with response:
+            if response.status >= 400:
+                return node_id, response.status, None
+            try:
+                return node_id, response.status, await response.json()
+            except (ClientError, ValueError, TypeError) as err:
+                raise TailscaleTrustConnectionError(
+                    "Routes endpoint returned invalid JSON"
                 ) from err
