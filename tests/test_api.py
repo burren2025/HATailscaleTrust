@@ -11,6 +11,7 @@ import pytest
 from custom_components.tailscale_trust.api import (
     TailscaleTrustAuthenticationError,
     TailscaleTrustClient,
+    TailscaleTrustPermissionError,
     parse_device,
 )
 from custom_components.tailscale_trust.const import OAUTH_SCOPE
@@ -74,6 +75,15 @@ def _device_payload(**updates: Any) -> dict[str, Any]:
     return payload
 
 
+def _routes_payload(
+    *, advertised: list[str] | None = None, enabled: list[str] | None = None
+) -> dict[str, Any]:
+    return {
+        "advertisedRoutes": advertised or [],
+        "enabledRoutes": enabled or [],
+    }
+
+
 @pytest.mark.asyncio
 async def test_token_is_cached_and_refreshed_before_expiry() -> None:
     """One-hour tokens are reused until the early-refresh margin."""
@@ -85,8 +95,11 @@ async def test_token_is_cached_and_refreshed_before_expiry() -> None:
         ],
         gets=[
             FakeResponse(200, {"devices": [_device_payload()]}),
+            FakeResponse(200, _routes_payload()),
             FakeResponse(200, {"devices": [_device_payload()]}),
+            FakeResponse(200, _routes_payload()),
             FakeResponse(200, {"devices": [_device_payload()]}),
+            FakeResponse(200, _routes_payload()),
         ],
     )
     client = TailscaleTrustClient(
@@ -108,7 +121,8 @@ async def test_token_is_cached_and_refreshed_before_expiry() -> None:
     assert session.post_calls[0]["data"]["scope"] == OAUTH_SCOPE
     assert session.post_calls[0]["data"]["grant_type"] == "client_credentials"
     assert session.get_calls[-1]["headers"]["Authorization"] == "Bearer token-2"
-    assert session.get_calls[-1]["params"] == {"fields": "all"}
+    assert session.get_calls[-2]["params"] == {"fields": "all"}
+    assert session.get_calls[-1]["url"].endswith("/device/nNODE123/routes")
 
 
 @pytest.mark.asyncio
@@ -122,6 +136,7 @@ async def test_401_refreshes_token_and_retries_once() -> None:
         gets=[
             FakeResponse(401),
             FakeResponse(200, {"devices": [_device_payload()]}),
+            FakeResponse(200, _routes_payload()),
         ],
     )
     client = TailscaleTrustClient(
@@ -135,8 +150,98 @@ async def test_401_refreshes_token_and_retries_once() -> None:
 
     assert list(devices) == ["nNODE123"]
     assert len(session.post_calls) == 2
-    assert len(session.get_calls) == 2
+    assert len(session.get_calls) == 3
     assert session.get_calls[1]["headers"]["Authorization"] == "Bearer fresh"
+
+
+@pytest.mark.asyncio
+async def test_routes_are_read_with_the_narrow_route_scope() -> None:
+    """Advertised and enabled routes are attached to their immutable node."""
+    session = FakeSession(
+        posts=[FakeResponse(200, {"access_token": "token", "expires_in": 3600})],
+        gets=[
+            FakeResponse(200, {"devices": [_device_payload()]}),
+            FakeResponse(
+                200,
+                _routes_payload(
+                    advertised=["0.0.0.0/0", "::/0", "192.168.50.0/24"],
+                    enabled=["0.0.0.0/0", "::/0"],
+                ),
+            ),
+        ],
+    )
+    client = TailscaleTrustClient(
+        session,  # type: ignore[arg-type]
+        tailnet="example.com",
+        client_id="test-client",
+        client_secret="test-secret",
+    )
+
+    device = (await client.async_list_devices())["nNODE123"]
+
+    assert session.post_calls[0]["data"]["scope"] == (
+        "devices:core:read devices:routes:read"
+    )
+    assert device.routes_available is True
+    assert device.advertised_routes == (
+        "0.0.0.0/0",
+        "::/0",
+        "192.168.50.0/24",
+    )
+    assert device.enabled_routes == ("0.0.0.0/0", "::/0")
+    assert device.advertises_exit_node is True
+    assert device.exit_node_enabled is True
+    assert device.advertises_subnet_routes is True
+    assert device.routes_awaiting_approval == ("192.168.50.0/24",)
+
+
+@pytest.mark.asyncio
+async def test_route_401_refreshes_token_and_retries_once() -> None:
+    """An authentication failure on the routes endpoint refreshes the token."""
+    session = FakeSession(
+        posts=[
+            FakeResponse(200, {"access_token": "stale", "expires_in": 3600}),
+            FakeResponse(200, {"access_token": "fresh", "expires_in": 3600}),
+        ],
+        gets=[
+            FakeResponse(200, {"devices": [_device_payload()]}),
+            FakeResponse(401),
+            FakeResponse(200, {"devices": [_device_payload()]}),
+            FakeResponse(200, _routes_payload()),
+        ],
+    )
+    client = TailscaleTrustClient(
+        session,  # type: ignore[arg-type]
+        tailnet="example.com",
+        client_id="test-client",
+        client_secret="test-secret",
+    )
+
+    await client.async_list_devices()
+
+    assert len(session.post_calls) == 2
+    assert session.get_calls[-1]["headers"]["Authorization"] == "Bearer fresh"
+
+
+@pytest.mark.asyncio
+async def test_missing_route_scope_is_a_permission_failure() -> None:
+    """A route permission denial starts Home Assistant reauthentication."""
+    session = FakeSession(
+        posts=[FakeResponse(200, {"access_token": "token", "expires_in": 3600})],
+        gets=[
+            FakeResponse(200, {"devices": [_device_payload()]}),
+            FakeResponse(403),
+        ],
+    )
+    client = TailscaleTrustClient(
+        session,  # type: ignore[arg-type]
+        tailnet="example.com",
+        client_id="test-client",
+        client_secret="test-secret",
+    )
+
+    with pytest.raises(TailscaleTrustPermissionError):
+        await client.async_list_devices()
 
 
 @pytest.mark.asyncio
@@ -155,6 +260,23 @@ async def test_revoked_oauth_client_is_authentication_failure() -> None:
 
     assert "never-log-this" not in str(err.value)
     assert "echo" not in str(err.value)
+
+
+@pytest.mark.asyncio
+async def test_oauth_invalid_scope_is_a_permission_failure() -> None:
+    """OAuth invalid_scope is distinguished from a bad client secret."""
+    session = FakeSession(
+        posts=[FakeResponse(400, {"error": "invalid_scope"})], gets=[]
+    )
+    client = TailscaleTrustClient(
+        session,  # type: ignore[arg-type]
+        tailnet="example.com",
+        client_id="test-client",
+        client_secret="test-secret",
+    )
+
+    with pytest.raises(TailscaleTrustPermissionError):
+        await client.async_list_devices()
 
 
 def test_online_uses_authoritative_connectivity() -> None:

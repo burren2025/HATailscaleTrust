@@ -3,7 +3,8 @@
 Tailscale Trust is a Home Assistant custom integration that monitors every device
 in a Tailscale tailnet with a long-lived OAuth trust credential. It replaces the
 manually rotated, fully permitted API access token used by Home Assistant's
-built-in Tailscale integration with the narrow `devices:core:read` scope.
+built-in Tailscale integration with the narrow `devices:core:read` and
+`devices:routes:read` scopes.
 
 The integration never asks for or uses a write scope. Its one-hour access tokens
 are cached only in memory, refreshed before expiry, and recreated automatically.
@@ -25,6 +26,12 @@ Each Tailscale device gets:
 | Binary sensor | Client supports PMP | Yes |
 | Binary sensor | Client supports UDP | Yes |
 | Binary sensor | Client supports UPnP | Yes |
+| Sensor | Advertised routes (count plus exact CIDRs) | New |
+| Sensor | Enabled routes (count plus exact CIDRs) | New |
+| Binary sensor | Exit node advertised | New |
+| Binary sensor | Exit node enabled | New |
+| Binary sensor | Subnet routes advertised | New |
+| Binary sensor | Route approval required | New |
 
 Unique IDs use Tailscale's immutable `nodeId`, not a device name. Renaming a
 device therefore updates its displayed device name without duplicating its
@@ -53,6 +60,18 @@ online sensor remains available and reports off. Its other sensors become
 unavailable. The registry record is retained so a temporary absence or later
 return cannot create duplicates.
 
+### Route state
+
+For every device, the integration reads Tailscale's dedicated route-settings
+endpoint. The advertised and enabled route sensors use a numeric count for
+automation-friendly states and expose the exact CIDRs in their `routes`
+attribute. Exit-node routes are the IPv4 and IPv6 default routes
+(`0.0.0.0/0` and `::/0`). The **Route approval required** problem sensor turns
+on whenever a device advertises a route that is not enabled in the tailnet.
+
+Route state is control-plane configuration. It does not prove that IP
+forwarding or a routed destination is reachable end to end.
+
 ## Create the least-privilege trust credential
 
 Never paste a real client secret into a source file, issue, test, log, or chat.
@@ -61,21 +80,25 @@ Enter it only in Home Assistant's masked setup form.
 1. Sign in to the Tailscale admin console and open
    [Trust credentials](https://console.tailscale.com/admin/settings/trust-credentials).
 2. Select **Credential**, then **OAuth**.
-3. In the operations list, find **Devices** and **Core**.
-4. Select **Read** only. The resulting scope is exactly
-   `devices:core:read`. Do not select Write, `all:read`, or `all`.
-5. Select **Generate credential**.
-6. Copy the client ID and client secret to a password manager. Tailscale shows
+3. In the operations list, expand **Devices**.
+4. Under **Core**, select **Read** only (`devices:core:read`).
+5. Under **Routes**, select **Read** only (`devices:routes:read`).
+6. Leave every Write box and all other scopes unchecked. Do not select
+   `all:read` or `all`.
+7. Select **Generate credential**.
+8. Copy the client ID and client secret to a password manager. Tailscale shows
    the secret only once.
-7. Find the tailnet identifier on the admin console's **General** page. The `-`
+9. Find the tailnet identifier on the admin console's **General** page. The `-`
    shorthand also works, but the explicit identifier gives the Home Assistant
    entry a clearer name.
-8. In Home Assistant, open **Settings > Devices & services > Add integration**,
+10. In Home Assistant, open **Settings > Devices & services > Add integration**,
    search for **Tailscale Trust**, and enter the tailnet identifier, client ID,
    and client secret.
 
-The setup validation exchanges the credential for an access token and calls only
-`GET /api/v2/tailnet/{tailnet}/devices?fields=all`.
+The setup validation exchanges the credential for an access token, calls
+`GET /api/v2/tailnet/{tailnet}/devices?fields=all`, and reads
+`GET /api/v2/device/{nodeId}/routes` for each returned device. It never writes
+route settings.
 
 ## Installation
 
@@ -100,6 +123,15 @@ The final path must contain `manifest.json` directly under
 
 The repository includes `hacs.json` and the standard custom-integration layout;
 it does not require a separate Python package.
+
+### Upgrades through HACS
+
+Stable versions are published as GitHub releases with semantic tags such as
+`v0.2.0`. HACS uses the latest published release tag as the remote version; a
+tag without a published release is not sufficient. In HACS, open the Tailscale
+Trust repository menu and select **Update information** to force an immediate
+GitHub refresh if the update entity has not refreshed yet. Download the offered
+version and restart Home Assistant.
 
 ## Safe migration from the built-in integration
 
@@ -166,7 +198,7 @@ this integration deliberately prefers `nodeId`.
   bodies are never logged or included in exceptions.
 - OAuth exchange uses the client-credentials grant at
   `https://api.tailscale.com/api/v2/oauth/token` and explicitly requests only
-  `devices:core:read`.
+  `devices:core:read devices:routes:read`.
 - Access tokens are held only in memory. The cache uses monotonic time and a
   60-second early-refresh margin to tolerate wall-clock skew.
 - A device API 401 discards the token, exchanges the OAuth credential again, and
@@ -189,10 +221,11 @@ ruff check .
 pytest
 ```
 
-Tests cover setup and reauthentication flows, OAuth caching and refresh, the
-single 401 retry, revoked credentials, coordinator reconciliation, authoritative
-and fallback online state, stable unique IDs, entity coverage, and diagnostics
-redaction.
+Tests cover setup and reauthentication flows, OAuth caching and refresh, 401
+retries on both device and route reads, revoked credentials, missing scopes,
+route parsing and entity state, coordinator reconciliation, authoritative and
+fallback online state, stable unique IDs, entity coverage, and diagnostics
+redaction. GitHub Actions also runs HACS's own integration repository validator.
 
 ## Known limitations
 
@@ -201,11 +234,11 @@ redaction.
   Assistant. Tailscale does not expose the local CLI's peer `Online` field through
   the remote Devices API; `connectedToControl` is the best authoritative remote
   field currently available.
-- `devices:core:read` permits the device-list and individual-device read
-  endpoints but not the separate route-settings endpoint. To preserve least
-  privilege, this integration does not request `devices:routes:read` and does not
-  expose route approval state. It identifies subnet routers and exit nodes only
-  through the device entities the API makes available under the core scope.
+- Route reads add one API request per device per polling cycle. Requests run
+  concurrently, but very large tailnets generate more API traffic than the
+  device-only integration.
+- The route API reports advertised and enabled control-plane routes. It does not
+  confirm kernel IP forwarding, peer selection, or end-to-end reachability.
 - Permanent device removal is indistinguishable from a temporary omission in a
   single poll. The integration keeps the registry entries offline rather than
   destructively deleting customizations. Users can remove permanently stale

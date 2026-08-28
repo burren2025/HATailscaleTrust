@@ -58,14 +58,45 @@ async def test_useful_built_in_entity_keys_are_reproduced(hass, device) -> None:
             "client_supports_pmp",
             "client_supports_udp",
             "client_supports_upnp",
+            "exit_node_advertised",
+            "exit_node_enabled",
+            "subnet_routes_advertised",
+            "route_approval_required",
         },
     }
+    expected["sensor"].update({"advertised_routes", "enabled_routes"})
 
     for platform, keys in expected.items():
         for key in keys:
             assert registry.async_get_entity_id(
                 platform, DOMAIN, f"{device.node_id}_{key}"
             )
+
+
+async def test_route_entities_expose_state_and_exact_routes(hass, device) -> None:
+    """Route counts support automations while attributes preserve the CIDRs."""
+    await _setup(hass, {device.node_id: device})
+    registry = er.async_get(hass)
+
+    advertised_id = registry.async_get_entity_id(
+        "sensor", DOMAIN, f"{device.node_id}_advertised_routes"
+    )
+    approval_id = registry.async_get_entity_id(
+        "binary_sensor", DOMAIN, f"{device.node_id}_route_approval_required"
+    )
+    exit_id = registry.async_get_entity_id(
+        "binary_sensor", DOMAIN, f"{device.node_id}_exit_node_enabled"
+    )
+
+    advertised = hass.states.get(advertised_id)
+    assert advertised.state == "3"
+    assert advertised.attributes["routes"] == [
+        "0.0.0.0/0",
+        "::/0",
+        "192.168.50.0/24",
+    ]
+    assert hass.states.get(approval_id).state == "on"
+    assert hass.states.get(exit_id).state == "on"
 
 
 async def test_device_rename_does_not_change_unique_id(hass, device) -> None:

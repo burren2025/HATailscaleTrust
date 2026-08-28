@@ -28,6 +28,7 @@ class TailscaleTrustBinarySensorEntityDescription(BinarySensorEntityDescription)
 
     is_on_fn: Callable[[TailscaleDevice], bool | None]
     available_when_absent: bool = False
+    requires_routes: bool = False
 
 
 BINARY_SENSORS: tuple[TailscaleTrustBinarySensorEntityDescription, ...] = (
@@ -81,6 +82,38 @@ BINARY_SENSORS: tuple[TailscaleTrustBinarySensorEntityDescription, ...] = (
         entity_category=EntityCategory.DIAGNOSTIC,
         is_on_fn=lambda device: device.client_supports.upnp,
     ),
+    TailscaleTrustBinarySensorEntityDescription(
+        key="exit_node_advertised",
+        translation_key="exit_node_advertised",
+        entity_category=EntityCategory.DIAGNOSTIC,
+        icon="mdi:exit-run",
+        is_on_fn=lambda device: device.advertises_exit_node,
+        requires_routes=True,
+    ),
+    TailscaleTrustBinarySensorEntityDescription(
+        key="exit_node_enabled",
+        translation_key="exit_node_enabled",
+        entity_category=EntityCategory.DIAGNOSTIC,
+        icon="mdi:exit-to-app",
+        is_on_fn=lambda device: device.exit_node_enabled,
+        requires_routes=True,
+    ),
+    TailscaleTrustBinarySensorEntityDescription(
+        key="subnet_routes_advertised",
+        translation_key="subnet_routes_advertised",
+        entity_category=EntityCategory.DIAGNOSTIC,
+        icon="mdi:router-network",
+        is_on_fn=lambda device: device.advertises_subnet_routes,
+        requires_routes=True,
+    ),
+    TailscaleTrustBinarySensorEntityDescription(
+        key="route_approval_required",
+        translation_key="route_approval_required",
+        device_class=BinarySensorDeviceClass.PROBLEM,
+        entity_category=EntityCategory.DIAGNOSTIC,
+        is_on_fn=lambda device: bool(device.routes_awaiting_approval),
+        requires_routes=True,
+    ),
 )
 
 
@@ -124,7 +157,9 @@ class TailscaleTrustBinarySensorEntity(TailscaleTrustEntity, BinarySensorEntity)
         """Keep connectivity available and off for omitted devices."""
         if self.entity_description.available_when_absent:
             return self.coordinator.last_update_success and self.is_on is not None
-        return super().available
+        return super().available and (
+            not self.entity_description.requires_routes or self.device.routes_available
+        )
 
     @property
     @override
