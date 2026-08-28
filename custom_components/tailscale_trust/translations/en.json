@@ -6,13 +6,13 @@
     },
     "error": {
       "cannot_connect": "Failed to connect to Tailscale",
-      "insufficient_scope": "The OAuth client must have devices:core:read access",
+      "insufficient_scope": "The OAuth client must have devices:core:read and devices:routes:read access",
       "invalid_auth": "The OAuth client ID or secret is invalid or revoked"
     },
     "step": {
       "user": {
         "title": "Connect a Tailscale tailnet",
-        "description": "Create a read-only OAuth client on the [Trust credentials page]({trust_credentials_url}) with only **Devices > Core: Read** (`devices:core:read`).",
+        "description": "Create a read-only OAuth client on the [Trust credentials page]({trust_credentials_url}) with **Devices > Core: Read** (`devices:core:read`) and **Devices > Routes: Read** (`devices:routes:read`).",
         "data": {
           "tailnet": "Tailnet identifier",
           "client_id": "OAuth client ID",
@@ -24,7 +24,7 @@
       },
       "reauth_confirm": {
         "title": "Reconnect Tailscale Trust",
-        "description": "The credential for `{tailnet}` was rejected. Create or select a read-only OAuth client on the [Trust credentials page]({trust_credentials_url}) and enter the replacement credentials.",
+        "description": "The credential for `{tailnet}` was rejected or lacks a required scope. Create or select a read-only OAuth client on the [Trust credentials page]({trust_credentials_url}) with Devices Core Read and Devices Routes Read, then enter the replacement credentials.",
         "data": {
           "client_id": "OAuth client ID",
           "client_secret": "OAuth client secret"
@@ -57,6 +57,18 @@
       },
       "client_supports_upnp": {
         "name": "Client supports UPnP"
+      },
+      "exit_node_advertised": {
+        "name": "Exit node advertised"
+      },
+      "exit_node_enabled": {
+        "name": "Exit node enabled"
+      },
+      "subnet_routes_advertised": {
+        "name": "Subnet routes advertised"
+      },
+      "route_approval_required": {
+        "name": "Route approval required"
       }
     },
     "sensor": {
@@ -68,6 +80,12 @@
       },
       "last_seen": {
         "name": "Last seen"
+      },
+      "advertised_routes": {
+        "name": "Advertised routes"
+      },
+      "enabled_routes": {
+        "name": "Enabled routes"
       }
     }
   }
