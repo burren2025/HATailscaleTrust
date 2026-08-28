@@ -36,3 +36,6 @@ async def test_credentials_are_redacted(hass, device) -> None:
     assert "sensitive-client-id" not in serialized
     assert "sensitive-client-secret" not in serialized
     assert "example.com" in serialized
+    assert diagnostics["devices"][device.node_id]["routes_awaiting_approval"] == (
+        "192.168.50.0/24",
+    )

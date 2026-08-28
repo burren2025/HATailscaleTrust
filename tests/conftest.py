@@ -37,4 +37,7 @@ def device() -> TailscaleDevice:
         client_supports=ClientSupports(
             ipv6=True, pcp=False, pmp=False, udp=True, upnp=False
         ),
+        advertised_routes=("0.0.0.0/0", "::/0", "192.168.50.0/24"),
+        enabled_routes=("0.0.0.0/0", "::/0"),
+        routes_available=True,
     )
