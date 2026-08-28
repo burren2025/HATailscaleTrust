@@ -73,6 +73,8 @@ class TailscaleTrustConfigFlow(ConfigFlow, domain=DOMAIN):
                 CONF_CLIENT_ID: user_input[CONF_CLIENT_ID].strip(),
                 CONF_CLIENT_SECRET: user_input[CONF_CLIENT_SECRET].strip(),
             }
+            await self.async_set_unique_id(clean[CONF_TAILNET].casefold())
+            self._abort_if_unique_id_configured()
             try:
                 await async_validate_input(self.hass, **clean)
             except TailscaleTrustAuthenticationError:
@@ -82,8 +84,6 @@ class TailscaleTrustConfigFlow(ConfigFlow, domain=DOMAIN):
             except TailscaleTrustConnectionError:
                 errors["base"] = "cannot_connect"
             else:
-                await self.async_set_unique_id(clean[CONF_TAILNET].casefold())
-                self._abort_if_unique_id_configured()
                 return self.async_create_entry(title=clean[CONF_TAILNET], data=clean)
 
         return self.async_show_form(

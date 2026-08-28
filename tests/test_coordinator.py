@@ -4,10 +4,12 @@ from unittest.mock import AsyncMock
 
 import pytest
 from homeassistant.exceptions import ConfigEntryAuthFailed
+from homeassistant.helpers.update_coordinator import UpdateFailed
 from pytest_homeassistant_custom_component.common import MockConfigEntry
 
 from custom_components.tailscale_trust.api import (
     TailscaleTrustAuthenticationError,
+    TailscaleTrustRateLimitError,
 )
 from custom_components.tailscale_trust.const import (
     CONF_CLIENT_ID,
@@ -61,3 +63,18 @@ async def test_revoked_credentials_raise_config_entry_auth_failed(hass) -> None:
 
     with pytest.raises(ConfigEntryAuthFailed):
         await coordinator._async_update_data()
+
+
+async def test_rate_limit_schedules_server_requested_retry(hass) -> None:
+    """The coordinator passes a sanitized retry delay to Home Assistant."""
+    entry = _entry()
+    entry.add_to_hass(hass)
+    coordinator = TailscaleTrustDataUpdateCoordinator(hass, entry)
+    coordinator.client.async_list_devices = AsyncMock(
+        side_effect=TailscaleTrustRateLimitError(180)
+    )
+
+    with pytest.raises(UpdateFailed) as err:
+        await coordinator._async_update_data()
+
+    assert err.value.retry_after == 180

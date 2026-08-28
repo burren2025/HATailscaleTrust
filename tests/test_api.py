@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from collections import deque
 from datetime import UTC, datetime, timedelta
 from typing import Any
@@ -11,18 +12,30 @@ import pytest
 from custom_components.tailscale_trust.api import (
     TailscaleTrustAuthenticationError,
     TailscaleTrustClient,
+    TailscaleTrustConnectionError,
     TailscaleTrustPermissionError,
+    TailscaleTrustRateLimitError,
     parse_device,
 )
-from custom_components.tailscale_trust.const import OAUTH_SCOPE
+from custom_components.tailscale_trust.const import (
+    OAUTH_SCOPE,
+    ROUTE_REQUEST_CONCURRENCY,
+)
 
 
 class FakeResponse:
     """Small aiohttp response substitute."""
 
-    def __init__(self, status: int, payload: Any = None) -> None:
+    def __init__(
+        self,
+        status: int,
+        payload: Any = None,
+        *,
+        headers: dict[str, str] | None = None,
+    ) -> None:
         self.status = status
         self.payload = payload
+        self.headers = headers or {}
 
     async def __aenter__(self):
         return self
@@ -31,6 +44,8 @@ class FakeResponse:
         return None
 
     async def json(self) -> Any:
+        if isinstance(self.payload, BaseException):
+            raise self.payload
         return self.payload
 
 
@@ -319,3 +334,152 @@ def test_online_fallback_uses_recent_last_seen() -> None:
 def test_node_id_is_preferred_over_legacy_id() -> None:
     """The immutable node ID is the stable entity identity."""
     assert parse_device(_device_payload()).node_id == "nNODE123"
+
+
+@pytest.mark.asyncio
+async def test_device_rate_limit_uses_retry_after() -> None:
+    """A device-list 429 tells the coordinator when it may safely retry."""
+    session = FakeSession(
+        posts=[FakeResponse(200, {"access_token": "token", "expires_in": 3600})],
+        gets=[FakeResponse(429, headers={"Retry-After": "120"})],
+    )
+    client = TailscaleTrustClient(
+        session,  # type: ignore[arg-type]
+        tailnet="example.com",
+        client_id="test-client",
+        client_secret="test-secret",
+    )
+
+    with pytest.raises(TailscaleTrustRateLimitError) as err:
+        await client.async_list_devices()
+
+    assert err.value.retry_after == 120
+
+
+@pytest.mark.asyncio
+async def test_token_rate_limit_uses_bounded_fallback() -> None:
+    """OAuth throttling without Retry-After receives jittered exponential delay."""
+    session = FakeSession(posts=[FakeResponse(429)], gets=[])
+    client = TailscaleTrustClient(
+        session,  # type: ignore[arg-type]
+        tailnet="example.com",
+        client_id="test-client",
+        client_secret="test-secret",
+        random_value=lambda: 0.5,
+    )
+
+    with pytest.raises(TailscaleTrustRateLimitError) as err:
+        await client.async_list_devices()
+
+    assert err.value.retry_after == 300
+
+
+@pytest.mark.asyncio
+async def test_route_rate_limit_preserves_cache_and_defers_routes() -> None:
+    """Route throttling retains known state while device polling continues."""
+    now = [0.0]
+    cached_routes = _routes_payload(
+        advertised=["0.0.0.0/0", "::/0"], enabled=["0.0.0.0/0", "::/0"]
+    )
+    session = FakeSession(
+        posts=[FakeResponse(200, {"access_token": "token", "expires_in": 3600})],
+        gets=[
+            FakeResponse(200, {"devices": [_device_payload()]}),
+            FakeResponse(200, cached_routes),
+            FakeResponse(200, {"devices": [_device_payload()]}),
+            FakeResponse(429, headers={"Retry-After": "600"}),
+            FakeResponse(200, {"devices": [_device_payload()]}),
+        ],
+    )
+    client = TailscaleTrustClient(
+        session,  # type: ignore[arg-type]
+        tailnet="example.com",
+        client_id="test-client",
+        client_secret="test-secret",
+        monotonic=lambda: now[0],
+    )
+
+    first = (await client.async_list_devices())["nNODE123"]
+    now[0] = 601
+    throttled = (await client.async_list_devices())["nNODE123"]
+    now[0] = 700
+    deferred = (await client.async_list_devices())["nNODE123"]
+
+    assert first.enabled_routes == ("0.0.0.0/0", "::/0")
+    assert throttled.enabled_routes == first.enabled_routes
+    assert deferred.enabled_routes == first.enabled_routes
+    assert len(session.get_calls) == 5
+
+
+@pytest.mark.asyncio
+async def test_route_requests_have_bounded_concurrency() -> None:
+    """Large tailnets never fan out more than the configured route batch."""
+    client = TailscaleTrustClient(
+        FakeSession(posts=[], gets=[]),  # type: ignore[arg-type]
+        tailnet="example.com",
+        client_id="test-client",
+        client_secret="test-secret",
+    )
+    active = 0
+    maximum = 0
+
+    async def request(token: str, node_id: str):
+        nonlocal active, maximum
+        active += 1
+        maximum = max(maximum, active)
+        await asyncio.sleep(0)
+        active -= 1
+        return node_id, 200, _routes_payload(), None
+
+    client._async_routes_request = request  # type: ignore[method-assign]
+    results = await client._async_route_requests(
+        "token", tuple(f"node-{index}" for index in range(13))
+    )
+
+    assert len(results) == 13
+    assert maximum == ROUTE_REQUEST_CONCURRENCY
+
+
+@pytest.mark.asyncio
+async def test_one_malformed_device_does_not_fail_update() -> None:
+    """A bad record is skipped when the response still has usable devices."""
+    session = FakeSession(
+        posts=[FakeResponse(200, {"access_token": "token", "expires_in": 3600})],
+        gets=[
+            FakeResponse(200, {"devices": [{"name": "invalid"}, _device_payload()]}),
+            FakeResponse(200, _routes_payload()),
+        ],
+    )
+    client = TailscaleTrustClient(
+        session,  # type: ignore[arg-type]
+        tailnet="example.com",
+        client_id="test-client",
+        client_secret="test-secret",
+    )
+
+    assert list(await client.async_list_devices()) == ["nNODE123"]
+
+
+@pytest.mark.asyncio
+async def test_all_malformed_devices_fail_update() -> None:
+    """A structurally broken response is not mistaken for an empty tailnet."""
+    session = FakeSession(
+        posts=[FakeResponse(200, {"access_token": "token", "expires_in": 3600})],
+        gets=[FakeResponse(200, {"devices": [{"name": "invalid"}]})],
+    )
+    client = TailscaleTrustClient(
+        session,  # type: ignore[arg-type]
+        tailnet="example.com",
+        client_id="test-client",
+        client_secret="test-secret",
+    )
+
+    with pytest.raises(TailscaleTrustConnectionError):
+        await client.async_list_devices()
+
+
+def test_retry_after_parser_rejects_invalid_values() -> None:
+    """Malformed or non-finite rate headers cannot poison update scheduling."""
+    assert TailscaleTrustClient._parse_retry_after("not-a-date") is None
+    assert TailscaleTrustClient._parse_retry_after("nan") is None
+    assert TailscaleTrustClient._parse_retry_after("999999") == 3600

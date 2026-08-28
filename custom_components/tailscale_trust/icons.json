@@ -1,0 +1,23 @@
+{
+  "entity": {
+    "binary_sensor": {
+      "exit_node_advertised": {
+        "default": "mdi:exit-run"
+      },
+      "exit_node_enabled": {
+        "default": "mdi:exit-to-app"
+      },
+      "subnet_routes_advertised": {
+        "default": "mdi:router-network"
+      }
+    },
+    "sensor": {
+      "advertised_routes": {
+        "default": "mdi:routes"
+      },
+      "enabled_routes": {
+        "default": "mdi:routes-clock"
+      }
+    }
+  }
+}

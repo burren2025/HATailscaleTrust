@@ -17,6 +17,7 @@ from .api import (
     TailscaleTrustClient,
     TailscaleTrustError,
     TailscaleTrustPermissionError,
+    TailscaleTrustRateLimitError,
 )
 from .const import (
     CONF_CLIENT_ID,
@@ -67,6 +68,11 @@ class TailscaleTrustDataUpdateCoordinator(
         ) as err:
             raise ConfigEntryAuthFailed(
                 "The Tailscale OAuth client is invalid, revoked, or lacks read access"
+            ) from err
+        except TailscaleTrustRateLimitError as err:
+            raise UpdateFailed(
+                "Tailscale API rate limit exceeded",
+                retry_after=err.retry_after,
             ) from err
         except TailscaleTrustError as err:
             raise UpdateFailed(str(err)) from err

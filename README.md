@@ -33,6 +33,12 @@ Each Tailscale device gets:
 | Binary sensor | Subnet routes advertised | New |
 | Binary sensor | Route approval required | New |
 
+The five low-level **Client supports...** protocol sensors are created in the
+entity registry but disabled by default on new installations. Enable any of
+them from **Settings > Devices & services > Entities** if you use those details
+in diagnostics or automations. Existing entities that a previous version
+already enabled remain enabled; an upgrade does not overwrite registry choices.
+
 Unique IDs use Tailscale's immutable `nodeId`, not a device name. Renaming a
 device therefore updates its displayed device name without duplicating its
 entities. A device re-enrolled as a genuinely new Tailscale node receives new
@@ -62,8 +68,15 @@ return cannot create duplicates.
 
 ### Route state
 
-For every device, the integration reads Tailscale's dedicated route-settings
-endpoint. The advertised and enabled route sensors use a numeric count for
+The device list and online state update every minute. Route configuration
+changes less often, so the dedicated route-settings endpoint updates every ten
+minutes, in batches of no more than five concurrent requests. The most recent
+successful route state is cached in memory and remains available between route
+updates. A Tailscale `429` response honors `Retry-After`; if the header is
+missing or invalid, the integration uses bounded exponential backoff with
+jitter while normal device polling continues.
+
+The advertised and enabled route sensors use a numeric count for
 automation-friendly states and expose the exact CIDRs in their `routes`
 attribute. Exit-node routes are the IPv4 and IPv6 default routes
 (`0.0.0.0/0` and `::/0`). The **Route approval required** problem sensor turns
@@ -102,6 +115,10 @@ route settings.
 
 ## Installation
 
+Home Assistant 2025.12.0 or newer is required. This floor allows the
+integration to pass Tailscale's server-requested retry delay to Home Assistant
+instead of continuing fixed one-minute retries after throttling.
+
 ### Manual
 
 1. Download this repository.
@@ -127,7 +144,7 @@ it does not require a separate Python package.
 ### Upgrades through HACS
 
 Stable versions are published as GitHub releases with semantic tags such as
-`v0.2.0`. HACS uses the latest published release tag as the remote version; a
+`v0.3.0`. HACS uses the latest published release tag as the remote version; a
 tag without a published release is not sufficient. In HACS, open the Tailscale
 Trust repository menu and select **Update information** to force an immediate
 GitHub refresh if the update entity has not refreshed yet. Download the offered
@@ -192,10 +209,15 @@ this integration deliberately prefers `nodeId`.
 ## Architecture and security
 
 - Home Assistant stores the tailnet ID, OAuth client ID, and OAuth client secret
-  in the config entry. Home Assistant administrators should protect backups and
-  the config directory as they would any other integration credential.
-- Diagnostics recursively redact both the client ID and client secret. API error
-  bodies are never logged or included in exceptions.
+  in its config-entry storage. Like most Home Assistant integration
+  credentials, the secret is stored as plaintext inside the protected Home
+  Assistant configuration directory; it is only as secure as that directory
+  and its backups. It is never committed to this repository.
+- Downloaded diagnostics omit the credential, tailnet identifier, entry title
+  and unique ID, node IDs, device names and hostnames, IP addresses, and route
+  CIDRs. Device records are numbered per download and expose only aggregate or
+  low-sensitivity operational fields. API error bodies are never logged or
+  included in exceptions.
 - OAuth exchange uses the client-credentials grant at
   `https://api.tailscale.com/api/v2/oauth/token` and explicitly requests only
   `devices:core:read devices:routes:read`.
@@ -205,7 +227,9 @@ this integration deliberately prefers `nodeId`.
   retries once. A second 401, revoked client, or lost scope raises Home
   Assistant's config-entry authentication failure, preserving the config entry
   and opening its reauthentication repair flow.
-- One coordinator polls once per minute and shares data across all entities.
+- One coordinator polls device connectivity once per minute and shares data
+  across all entities. Route data is refreshed every ten minutes with bounded
+  concurrency, caching, and rate-limit backoff.
 - New devices are discovered after setup. Missing devices remain registered and
   offline; reappearance under the same `nodeId` reuses the same entities.
 
@@ -218,14 +242,32 @@ python -m venv .venv
 . .venv/bin/activate
 python -m pip install -r requirements_test.txt
 ruff check .
-pytest
+ruff format --check .
+pytest --cov=custom_components.tailscale_trust --cov-fail-under=90
 ```
 
 Tests cover setup and reauthentication flows, OAuth caching and refresh, 401
 retries on both device and route reads, revoked credentials, missing scopes,
 route parsing and entity state, coordinator reconciliation, authoritative and
 fallback online state, stable unique IDs, entity coverage, and diagnostics
-redaction. GitHub Actions also runs HACS's own integration repository validator.
+redaction. GitHub Actions runs the HACS repository validator, Home Assistant's
+Hassfest validator, lint and format checks, dependency consistency checks, and
+the test suite with a 90% coverage floor. Workflow actions and Python test
+dependencies are pinned; Dependabot proposes reviewed updates.
+
+The `last_seen` timestamp can change frequently. On a large tailnet where that
+history is not useful, consider excluding these entities from Home Assistant's
+Recorder to reduce database churn:
+
+```yaml
+recorder:
+  exclude:
+    entity_globs:
+      - sensor.*_last_seen
+```
+
+Review the glob against your own entity IDs before deploying it because Recorder
+globs apply to every matching integration.
 
 ## Known limitations
 
@@ -234,9 +276,9 @@ redaction. GitHub Actions also runs HACS's own integration repository validator.
   Assistant. Tailscale does not expose the local CLI's peer `Online` field through
   the remote Devices API; `connectedToControl` is the best authoritative remote
   field currently available.
-- Route reads add one API request per device per polling cycle. Requests run
-  concurrently, but very large tailnets generate more API traffic than the
-  device-only integration.
+- Route reads still require one request per device when the ten-minute route
+  refresh is due. Batching, caching, and rate-limit backoff keep this predictable,
+  but a very large tailnet generates more API traffic than device-only polling.
 - The route API reports advertised and enabled control-plane routes. It does not
   confirm kernel IP forwarding, peer selection, or end-to-end reachability.
 - Permanent device removal is indistinguishable from a temporary omission in a

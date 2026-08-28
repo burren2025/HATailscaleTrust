@@ -17,7 +17,7 @@ from custom_components.tailscale_trust.diagnostics import (
 
 
 async def test_credentials_are_redacted(hass, device) -> None:
-    """Neither OAuth credential can appear in downloaded diagnostics."""
+    """Credentials, tailnet identity, and topology never enter diagnostics."""
     entry = MockConfigEntry(
         domain=DOMAIN,
         unique_id="example.com",
@@ -35,7 +35,18 @@ async def test_credentials_are_redacted(hass, device) -> None:
 
     assert "sensitive-client-id" not in serialized
     assert "sensitive-client-secret" not in serialized
-    assert "example.com" in serialized
-    assert diagnostics["devices"][device.node_id]["routes_awaiting_approval"] == (
-        "192.168.50.0/24",
-    )
+    assert "example.com" not in serialized
+    assert device.node_id not in serialized
+    assert device.name not in serialized
+    assert device.hostname not in serialized
+    assert "100.64.0.10" not in serialized
+    assert "192.168.50.0/24" not in serialized
+    assert diagnostics["summary"] == {
+        "device_count": 1,
+        "present_count": 1,
+        "online_count": 1,
+        "routes_available_count": 1,
+        "route_approval_required_count": 1,
+    }
+    assert diagnostics["devices"][0]["device"] == "device_1"
+    assert diagnostics["devices"][0]["routes_awaiting_approval_count"] == 1

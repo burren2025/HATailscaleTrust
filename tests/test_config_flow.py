@@ -8,6 +8,8 @@ from pytest_homeassistant_custom_component.common import MockConfigEntry
 
 from custom_components.tailscale_trust.api import (
     TailscaleTrustAuthenticationError,
+    TailscaleTrustConnectionError,
+    TailscaleTrustPermissionError,
 )
 from custom_components.tailscale_trust.const import (
     CONF_CLIENT_ID,
@@ -54,6 +56,50 @@ async def test_user_flow_invalid_auth(hass) -> None:
 
     assert result["type"] is FlowResultType.FORM
     assert result["errors"] == {"base": "invalid_auth"}
+
+
+async def test_user_flow_error_mapping(hass) -> None:
+    """Permission and network failures give actionable form errors."""
+    for index, (failure, error) in enumerate(
+        (
+            (TailscaleTrustPermissionError, "insufficient_scope"),
+            (TailscaleTrustConnectionError, "cannot_connect"),
+        )
+    ):
+        user_input = {**USER_INPUT, CONF_TAILNET: f"example-{index}.com"}
+        with patch(
+            "custom_components.tailscale_trust.config_flow.async_validate_input",
+            AsyncMock(side_effect=failure),
+        ):
+            result = await hass.config_entries.flow.async_init(
+                DOMAIN,
+                context={"source": config_entries.SOURCE_USER},
+                data=user_input,
+            )
+
+        assert result["type"] is FlowResultType.FORM
+        assert result["errors"] == {"base": error}
+
+
+async def test_duplicate_entry_aborts_before_live_validation(hass) -> None:
+    """Re-adding a tailnet does not spend API quota validating a duplicate."""
+    entry = MockConfigEntry(domain=DOMAIN, unique_id="example.com", data=USER_INPUT)
+    entry.add_to_hass(hass)
+    validate = AsyncMock()
+
+    with patch(
+        "custom_components.tailscale_trust.config_flow.async_validate_input",
+        validate,
+    ):
+        result = await hass.config_entries.flow.async_init(
+            DOMAIN,
+            context={"source": config_entries.SOURCE_USER},
+            data=USER_INPUT,
+        )
+
+    assert result["type"] is FlowResultType.ABORT
+    assert result["reason"] == "already_configured"
+    validate.assert_not_awaited()
 
 
 async def test_reauth_updates_entry_in_place(hass) -> None:

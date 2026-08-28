@@ -108,3 +108,28 @@ async def test_device_rename_does_not_change_unique_id(hass, device) -> None:
         registry.async_get_entity_id("sensor", DOMAIN, f"{device.node_id}_last_seen")
         is not None
     )
+
+
+async def test_verbose_capability_entities_are_disabled_by_default(
+    hass, device
+) -> None:
+    """Low-value protocol details do not create state or recorder churn by default."""
+    await _setup(hass, {device.node_id: device})
+    registry = er.async_get(hass)
+
+    for key in (
+        "client_supports_ipv6",
+        "client_supports_pcp",
+        "client_supports_pmp",
+        "client_supports_udp",
+        "client_supports_upnp",
+    ):
+        entity_id = registry.async_get_entity_id(
+            "binary_sensor", DOMAIN, f"{device.node_id}_{key}"
+        )
+        assert entity_id is not None
+        assert (
+            registry.async_get(entity_id).disabled_by
+            is er.RegistryEntryDisabler.INTEGRATION
+        )
+        assert hass.states.get(entity_id) is None
