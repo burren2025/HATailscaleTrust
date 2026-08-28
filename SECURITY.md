@@ -19,7 +19,7 @@ Assistant's reauthentication flow to update the existing config entry.
 
 ## Credential model
 
-The integration requests only `devices:core:read devices:routes:read`. It stores
+The integration requests only `devices:core:read`. It stores
 the OAuth client credential in Home Assistant's protected config-entry storage,
 keeps short-lived access tokens in memory, redacts identifying topology from
 diagnostics, and never logs API response bodies.

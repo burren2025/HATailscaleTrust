@@ -3,6 +3,26 @@
 All notable changes to Tailscale Trust are documented here. Releases follow
 [Semantic Versioning](https://semver.org/).
 
+## 0.4.0 - 2026-08-28
+
+### Least privilege and API efficiency
+
+- Read advertised and enabled routes from the existing all-fields device-list
+  response, eliminating every per-device route request.
+- Reduce the requested OAuth access from two scopes to only
+  `devices:core:read`; `devices:routes:read` is no longer required.
+- Remove the route cache, batching, separate route cadence, and route-specific
+  failure paths made unnecessary by the single-response design.
+
+### Device lifecycle and compatibility
+
+- Enable Home Assistant's device delete action for a retained device only after
+  that device is absent from a successful Tailscale list response.
+- Protect devices still present in Tailscale from accidental registry deletion.
+- Test both the minimum supported Home Assistant 2025.12/Python 3.13 combination
+  and the current Home Assistant/Python 3.14 combination in CI.
+- Document current Home Assistant support for integration-local brand assets.
+
 ## 0.3.0 - 2026-08-27
 
 ### Security and privacy

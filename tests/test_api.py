@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import asyncio
 from collections import deque
 from datetime import UTC, datetime, timedelta
 from typing import Any
@@ -17,10 +16,7 @@ from custom_components.tailscale_trust.api import (
     TailscaleTrustRateLimitError,
     parse_device,
 )
-from custom_components.tailscale_trust.const import (
-    OAUTH_SCOPE,
-    ROUTE_REQUEST_CONCURRENCY,
-)
+from custom_components.tailscale_trust.const import OAUTH_SCOPE
 
 
 class FakeResponse:
@@ -76,6 +72,8 @@ def _device_payload(**updates: Any) -> dict[str, Any]:
         "addresses": ["100.64.0.10"],
         "connectedToControl": True,
         "lastSeen": None,
+        "advertisedRoutes": [],
+        "enabledRoutes": [],
         "clientConnectivity": {
             "clientSupports": {
                 "ipv6": True,
@@ -90,15 +88,6 @@ def _device_payload(**updates: Any) -> dict[str, Any]:
     return payload
 
 
-def _routes_payload(
-    *, advertised: list[str] | None = None, enabled: list[str] | None = None
-) -> dict[str, Any]:
-    return {
-        "advertisedRoutes": advertised or [],
-        "enabledRoutes": enabled or [],
-    }
-
-
 @pytest.mark.asyncio
 async def test_token_is_cached_and_refreshed_before_expiry() -> None:
     """One-hour tokens are reused until the early-refresh margin."""
@@ -110,11 +99,8 @@ async def test_token_is_cached_and_refreshed_before_expiry() -> None:
         ],
         gets=[
             FakeResponse(200, {"devices": [_device_payload()]}),
-            FakeResponse(200, _routes_payload()),
             FakeResponse(200, {"devices": [_device_payload()]}),
-            FakeResponse(200, _routes_payload()),
             FakeResponse(200, {"devices": [_device_payload()]}),
-            FakeResponse(200, _routes_payload()),
         ],
     )
     client = TailscaleTrustClient(
@@ -136,8 +122,7 @@ async def test_token_is_cached_and_refreshed_before_expiry() -> None:
     assert session.post_calls[0]["data"]["scope"] == OAUTH_SCOPE
     assert session.post_calls[0]["data"]["grant_type"] == "client_credentials"
     assert session.get_calls[-1]["headers"]["Authorization"] == "Bearer token-2"
-    assert session.get_calls[-2]["params"] == {"fields": "all"}
-    assert session.get_calls[-1]["url"].endswith("/device/nNODE123/routes")
+    assert session.get_calls[-1]["params"] == {"fields": "all"}
 
 
 @pytest.mark.asyncio
@@ -151,7 +136,6 @@ async def test_401_refreshes_token_and_retries_once() -> None:
         gets=[
             FakeResponse(401),
             FakeResponse(200, {"devices": [_device_payload()]}),
-            FakeResponse(200, _routes_payload()),
         ],
     )
     client = TailscaleTrustClient(
@@ -165,23 +149,30 @@ async def test_401_refreshes_token_and_retries_once() -> None:
 
     assert list(devices) == ["nNODE123"]
     assert len(session.post_calls) == 2
-    assert len(session.get_calls) == 3
+    assert len(session.get_calls) == 2
     assert session.get_calls[1]["headers"]["Authorization"] == "Bearer fresh"
 
 
 @pytest.mark.asyncio
-async def test_routes_are_read_with_the_narrow_route_scope() -> None:
-    """Advertised and enabled routes are attached to their immutable node."""
+async def test_routes_are_read_from_all_device_fields() -> None:
+    """The single all-fields response includes route state for each device."""
     session = FakeSession(
         posts=[FakeResponse(200, {"access_token": "token", "expires_in": 3600})],
         gets=[
-            FakeResponse(200, {"devices": [_device_payload()]}),
             FakeResponse(
                 200,
-                _routes_payload(
-                    advertised=["0.0.0.0/0", "::/0", "192.168.50.0/24"],
-                    enabled=["0.0.0.0/0", "::/0"],
-                ),
+                {
+                    "devices": [
+                        _device_payload(
+                            advertisedRoutes=[
+                                "0.0.0.0/0",
+                                "::/0",
+                                "192.168.50.0/24",
+                            ],
+                            enabledRoutes=["0.0.0.0/0", "::/0"],
+                        )
+                    ]
+                },
             ),
         ],
     )
@@ -194,9 +185,8 @@ async def test_routes_are_read_with_the_narrow_route_scope() -> None:
 
     device = (await client.async_list_devices())["nNODE123"]
 
-    assert session.post_calls[0]["data"]["scope"] == (
-        "devices:core:read devices:routes:read"
-    )
+    assert session.post_calls[0]["data"]["scope"] == "devices:core:read"
+    assert len(session.get_calls) == 1
     assert device.routes_available is True
     assert device.advertised_routes == (
         "0.0.0.0/0",
@@ -211,19 +201,14 @@ async def test_routes_are_read_with_the_narrow_route_scope() -> None:
 
 
 @pytest.mark.asyncio
-async def test_route_401_refreshes_token_and_retries_once() -> None:
-    """An authentication failure on the routes endpoint refreshes the token."""
+async def test_large_tailnet_still_uses_one_device_request() -> None:
+    """The all-fields design does not fan out as the tailnet grows."""
+    devices = [
+        _device_payload(nodeId=f"node-{index}", id=str(index)) for index in range(40)
+    ]
     session = FakeSession(
-        posts=[
-            FakeResponse(200, {"access_token": "stale", "expires_in": 3600}),
-            FakeResponse(200, {"access_token": "fresh", "expires_in": 3600}),
-        ],
-        gets=[
-            FakeResponse(200, {"devices": [_device_payload()]}),
-            FakeResponse(401),
-            FakeResponse(200, {"devices": [_device_payload()]}),
-            FakeResponse(200, _routes_payload()),
-        ],
+        posts=[FakeResponse(200, {"access_token": "token", "expires_in": 3600})],
+        gets=[FakeResponse(200, {"devices": devices})],
     )
     client = TailscaleTrustClient(
         session,  # type: ignore[arg-type]
@@ -232,21 +217,32 @@ async def test_route_401_refreshes_token_and_retries_once() -> None:
         client_secret="test-secret",
     )
 
-    await client.async_list_devices()
+    result = await client.async_list_devices()
 
-    assert len(session.post_calls) == 2
-    assert session.get_calls[-1]["headers"]["Authorization"] == "Bearer fresh"
+    assert len(result) == 40
+    assert len(session.get_calls) == 1
+    assert session.get_calls[0]["params"] == {"fields": "all"}
+
+
+def test_routes_are_unavailable_when_all_fields_are_missing() -> None:
+    """Route entities stay unavailable for an unexpected reduced response."""
+    payload = _device_payload()
+    payload.pop("advertisedRoutes")
+    payload.pop("enabledRoutes")
+
+    device = parse_device(payload)
+
+    assert device.routes_available is False
+    assert device.advertised_routes == ()
+    assert device.enabled_routes == ()
 
 
 @pytest.mark.asyncio
-async def test_missing_route_scope_is_a_permission_failure() -> None:
-    """A route permission denial starts Home Assistant reauthentication."""
+async def test_missing_device_scope_is_a_permission_failure() -> None:
+    """A list permission denial starts Home Assistant reauthentication."""
     session = FakeSession(
         posts=[FakeResponse(200, {"access_token": "token", "expires_in": 3600})],
-        gets=[
-            FakeResponse(200, {"devices": [_device_payload()]}),
-            FakeResponse(403),
-        ],
+        gets=[FakeResponse(403)],
     )
     client = TailscaleTrustClient(
         session,  # type: ignore[arg-type]
@@ -375,80 +371,11 @@ async def test_token_rate_limit_uses_bounded_fallback() -> None:
 
 
 @pytest.mark.asyncio
-async def test_route_rate_limit_preserves_cache_and_defers_routes() -> None:
-    """Route throttling retains known state while device polling continues."""
-    now = [0.0]
-    cached_routes = _routes_payload(
-        advertised=["0.0.0.0/0", "::/0"], enabled=["0.0.0.0/0", "::/0"]
-    )
-    session = FakeSession(
-        posts=[FakeResponse(200, {"access_token": "token", "expires_in": 3600})],
-        gets=[
-            FakeResponse(200, {"devices": [_device_payload()]}),
-            FakeResponse(200, cached_routes),
-            FakeResponse(200, {"devices": [_device_payload()]}),
-            FakeResponse(429, headers={"Retry-After": "600"}),
-            FakeResponse(200, {"devices": [_device_payload()]}),
-        ],
-    )
-    client = TailscaleTrustClient(
-        session,  # type: ignore[arg-type]
-        tailnet="example.com",
-        client_id="test-client",
-        client_secret="test-secret",
-        monotonic=lambda: now[0],
-    )
-
-    first = (await client.async_list_devices())["nNODE123"]
-    now[0] = 601
-    throttled = (await client.async_list_devices())["nNODE123"]
-    now[0] = 700
-    deferred = (await client.async_list_devices())["nNODE123"]
-
-    assert first.enabled_routes == ("0.0.0.0/0", "::/0")
-    assert throttled.enabled_routes == first.enabled_routes
-    assert deferred.enabled_routes == first.enabled_routes
-    assert len(session.get_calls) == 5
-
-
-@pytest.mark.asyncio
-async def test_route_requests_have_bounded_concurrency() -> None:
-    """Large tailnets never fan out more than the configured route batch."""
-    client = TailscaleTrustClient(
-        FakeSession(posts=[], gets=[]),  # type: ignore[arg-type]
-        tailnet="example.com",
-        client_id="test-client",
-        client_secret="test-secret",
-    )
-    active = 0
-    maximum = 0
-
-    async def request(token: str, node_id: str):
-        nonlocal active, maximum
-        active += 1
-        maximum = max(maximum, active)
-        await asyncio.sleep(0)
-        active -= 1
-        return node_id, 200, _routes_payload(), None
-
-    client._async_routes_request = request  # type: ignore[method-assign]
-    results = await client._async_route_requests(
-        "token", tuple(f"node-{index}" for index in range(13))
-    )
-
-    assert len(results) == 13
-    assert maximum == ROUTE_REQUEST_CONCURRENCY
-
-
-@pytest.mark.asyncio
 async def test_one_malformed_device_does_not_fail_update() -> None:
     """A bad record is skipped when the response still has usable devices."""
     session = FakeSession(
         posts=[FakeResponse(200, {"access_token": "token", "expires_in": 3600})],
-        gets=[
-            FakeResponse(200, {"devices": [{"name": "invalid"}, _device_payload()]}),
-            FakeResponse(200, _routes_payload()),
-        ],
+        gets=[FakeResponse(200, {"devices": [{"name": "invalid"}, _device_payload()]})],
     )
     client = TailscaleTrustClient(
         session,  # type: ignore[arg-type]

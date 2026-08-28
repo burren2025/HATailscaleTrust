@@ -3,8 +3,7 @@
 Tailscale Trust is a Home Assistant custom integration that monitors every device
 in a Tailscale tailnet with a long-lived OAuth trust credential. It replaces the
 manually rotated, fully permitted API access token used by Home Assistant's
-built-in Tailscale integration with the narrow `devices:core:read` and
-`devices:routes:read` scopes.
+built-in Tailscale integration with only the narrow `devices:core:read` scope.
 
 The integration never asks for or uses a write scope. Its one-hour access tokens
 are cached only in memory, refreshed before expiry, and recreated automatically.
@@ -64,17 +63,18 @@ Diagnostics report `online_source` as `connected_to_control`,
 previously known device disappears from a successful device-list response, its
 online sensor remains available and reports off. Its other sensors become
 unavailable. The registry record is retained so a temporary absence or later
-return cannot create duplicates.
+return cannot create duplicates. Once a device is absent, Home Assistant enables
+its device-registry delete action so you can explicitly remove a genuinely
+decommissioned node without risking deletion during a transient API omission.
 
 ### Route state
 
-The device list and online state update every minute. Route configuration
-changes less often, so the dedicated route-settings endpoint updates every ten
-minutes, in batches of no more than five concurrent requests. The most recent
-successful route state is cached in memory and remains available between route
-updates. A Tailscale `429` response honors `Retry-After`; if the header is
-missing or invalid, the integration uses bounded exponential backoff with
-jitter while normal device polling continues.
+Device, online, and route state update together every minute in one
+`GET /api/v2/tailnet/{tailnet}/devices?fields=all` request. Tailscale's
+all-fields response includes `advertisedRoutes` and `enabledRoutes`, so no
+per-device route requests or `devices:routes:read` scope are needed. A Tailscale
+`429` response honors `Retry-After`; if the header is missing or invalid, the
+integration uses bounded exponential backoff with jitter.
 
 The advertised and enabled route sensors use a numeric count for
 automation-friendly states and expose the exact CIDRs in their `routes`
@@ -95,23 +95,27 @@ Enter it only in Home Assistant's masked setup form.
 2. Select **Credential**, then **OAuth**.
 3. In the operations list, expand **Devices**.
 4. Under **Core**, select **Read** only (`devices:core:read`).
-5. Under **Routes**, select **Read** only (`devices:routes:read`).
-6. Leave every Write box and all other scopes unchecked. Do not select
+5. Leave **Routes** and every other scope unchecked. Leave every Write box
+   unchecked. Do not select
    `all:read` or `all`.
-7. Select **Generate credential**.
-8. Copy the client ID and client secret to a password manager. Tailscale shows
+6. Select **Generate credential**.
+7. Copy the client ID and client secret to a password manager. Tailscale shows
    the secret only once.
-9. Find the tailnet identifier on the admin console's **General** page. The `-`
+8. Find the tailnet identifier on the admin console's **General** page. The `-`
    shorthand also works, but the explicit identifier gives the Home Assistant
    entry a clearer name.
-10. In Home Assistant, open **Settings > Devices & services > Add integration**,
+9. In Home Assistant, open **Settings > Devices & services > Add integration**,
    search for **Tailscale Trust**, and enter the tailnet identifier, client ID,
    and client secret.
 
 The setup validation exchanges the credential for an access token, calls
-`GET /api/v2/tailnet/{tailnet}/devices?fields=all`, and reads
-`GET /api/v2/device/{nodeId}/routes` for each returned device. It never writes
-route settings.
+`GET /api/v2/tailnet/{tailnet}/devices?fields=all`, and reads device,
+connectivity, and route fields from that single response. It never writes
+Tailscale state.
+
+If you granted `devices:routes:read` for version 0.2 or 0.3, version 0.4 no longer
+requests or needs it. After upgrading successfully, you can edit the trust
+credential and remove **Devices > Routes: Read**.
 
 ## Installation
 
@@ -220,22 +224,24 @@ this integration deliberately prefers `nodeId`.
   included in exceptions.
 - OAuth exchange uses the client-credentials grant at
   `https://api.tailscale.com/api/v2/oauth/token` and explicitly requests only
-  `devices:core:read devices:routes:read`.
+  `devices:core:read`.
 - Access tokens are held only in memory. The cache uses monotonic time and a
   60-second early-refresh margin to tolerate wall-clock skew.
 - A device API 401 discards the token, exchanges the OAuth credential again, and
   retries once. A second 401, revoked client, or lost scope raises Home
   Assistant's config-entry authentication failure, preserving the config entry
   and opening its reauthentication repair flow.
-- One coordinator polls device connectivity once per minute and shares data
-  across all entities. Route data is refreshed every ten minutes with bounded
-  concurrency, caching, and rate-limit backoff.
+- One coordinator makes one all-fields device request per minute and shares
+  device, connectivity, and route data across all entities. Rate-limit responses
+  trigger bounded backoff and Home Assistant's server-directed retry support.
 - New devices are discovered after setup. Missing devices remain registered and
-  offline; reappearance under the same `nodeId` reuses the same entities.
+  offline; reappearance under the same `nodeId` reuses the same entities. A user
+  may manually delete a device only while it is absent from a successful list.
 
 ## Development
 
-Use Python 3.14.2 or newer (required by the pinned Home Assistant test version):
+The minimum-version lane uses Python 3.13 with Home Assistant 2025.12.2. The
+current-version lane uses Python 3.14.2 or newer:
 
 ```shell
 python -m venv .venv
@@ -247,13 +253,14 @@ pytest --cov=custom_components.tailscale_trust --cov-fail-under=90
 ```
 
 Tests cover setup and reauthentication flows, OAuth caching and refresh, 401
-retries on both device and route reads, revoked credentials, missing scopes,
-route parsing and entity state, coordinator reconciliation, authoritative and
-fallback online state, stable unique IDs, entity coverage, and diagnostics
+retry, revoked credentials, missing scope, all-fields route parsing and entity
+state, coordinator reconciliation, manual stale-device removal, authoritative
+and fallback online state, stable unique IDs, entity coverage, and diagnostics
 redaction. GitHub Actions runs the HACS repository validator, Home Assistant's
 Hassfest validator, lint and format checks, dependency consistency checks, and
-the test suite with a 90% coverage floor. Workflow actions and Python test
-dependencies are pinned; Dependabot proposes reviewed updates.
+the test suite with a 90% coverage floor on both the minimum supported Home
+Assistant/Python combination and the current combination. Workflow actions and
+Python test dependencies are pinned; Dependabot proposes reviewed updates.
 
 The `last_seen` timestamp can change frequently. On a large tailnet where that
 history is not useful, consider excluding these entities from Home Assistant's
@@ -276,19 +283,19 @@ globs apply to every matching integration.
   Assistant. Tailscale does not expose the local CLI's peer `Online` field through
   the remote Devices API; `connectedToControl` is the best authoritative remote
   field currently available.
-- Route reads still require one request per device when the ten-minute route
-  refresh is due. Batching, caching, and rate-limit backoff keep this predictable,
-  but a very large tailnet generates more API traffic than device-only polling.
-- The route API reports advertised and enabled control-plane routes. It does not
+- The all-fields device response reports advertised and enabled control-plane
+  routes. It does not
   confirm kernel IP forwarding, peer selection, or end-to-end reachability.
-- Permanent device removal is indistinguishable from a temporary omission in a
-  single poll. The integration keeps the registry entries offline rather than
-  destructively deleting customizations. Users can remove permanently stale
-  devices from Home Assistant's device registry after confirming removal.
+- Local brand assets are supported directly by Home Assistant 2026.3 and newer.
+  Home Assistant 2025.12 installations can still use the integration but may
+  display a generic custom-integration icon.
 
 ## References
 
 - [Tailscale trust credentials](https://tailscale.com/docs/reference/trust-credentials)
 - [Tailscale OAuth clients](https://tailscale.com/docs/features/oauth-clients)
+- [Tailscale Go client all-fields behavior](https://github.com/tailscale/tailscale-client-go-v2/blob/main/devices.go)
 - [Home Assistant Tailscale integration](https://www.home-assistant.io/integrations/tailscale)
 - [Home Assistant Tailscale source](https://github.com/home-assistant/core/tree/dev/homeassistant/components/tailscale)
+- [Home Assistant device-registry removal](https://developers.home-assistant.io/docs/device_registry_index/#removing-devices)
+- [Home Assistant local custom-integration brands](https://developers.home-assistant.io/blog/2026/02/24/brands-proxy-api/)

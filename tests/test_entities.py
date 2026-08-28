@@ -1,10 +1,13 @@
 """Tests for entity state and stable IDs."""
 
+from dataclasses import replace
 from unittest.mock import AsyncMock, patch
 
+from homeassistant.helpers import device_registry as dr
 from homeassistant.helpers import entity_registry as er
 from pytest_homeassistant_custom_component.common import MockConfigEntry
 
+from custom_components.tailscale_trust import async_remove_config_entry_device
 from custom_components.tailscale_trust.const import (
     CONF_CLIENT_ID,
     CONF_CLIENT_SECRET,
@@ -133,3 +136,18 @@ async def test_verbose_capability_entities_are_disabled_by_default(
             is er.RegistryEntryDisabler.INTEGRATION
         )
         assert hass.states.get(entity_id) is None
+
+
+async def test_only_absent_devices_can_be_manually_removed(hass, device) -> None:
+    """Protect live devices while enabling cleanup of retained stale devices."""
+    entry = await _setup(hass, {device.node_id: device})
+    registry = dr.async_get(hass)
+    device_entry = registry.async_get_device(identifiers={(DOMAIN, device.node_id)})
+    assert device_entry is not None
+
+    assert not await async_remove_config_entry_device(hass, entry, device_entry)
+
+    entry.runtime_data.async_set_updated_data(
+        {device.node_id: replace(device, present=False)}
+    )
+    assert await async_remove_config_entry_device(hass, entry, device_entry)

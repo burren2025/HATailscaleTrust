@@ -7,7 +7,7 @@ import math
 import random
 import time
 from collections.abc import Callable, Mapping
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from email.utils import parsedate_to_datetime
 from typing import Any, Final
@@ -23,8 +23,6 @@ from .const import (
     ONLINE_FALLBACK_WINDOW,
     RATE_LIMIT_DEFAULT_RETRY,
     RATE_LIMIT_MAX_RETRY,
-    ROUTE_REQUEST_CONCURRENCY,
-    ROUTE_SCAN_INTERVAL,
     TOKEN_REFRESH_SKEW,
 )
 
@@ -179,6 +177,8 @@ def parse_device(
             supports_raw = candidate
 
     addresses = raw.get("addresses")
+    advertised_routes = raw.get("advertisedRoutes")
+    enabled_routes = raw.get("enabledRoutes")
     return TailscaleDevice(
         node_id=immutable_id,
         legacy_id=legacy_id,
@@ -201,6 +201,10 @@ def parse_device(
             udp=_optional_bool(supports_raw.get("udp")),
             upnp=_optional_bool(supports_raw.get("upnp")),
         ),
+        advertised_routes=_string_tuple(advertised_routes),
+        enabled_routes=_string_tuple(enabled_routes),
+        routes_available=isinstance(advertised_routes, list)
+        and isinstance(enabled_routes, list),
     )
 
 
@@ -231,10 +235,7 @@ class TailscaleTrustClient:
         self._access_token: str | None = None
         self._token_expires_at = 0.0
         self._token_lock = asyncio.Lock()
-        self._device_rate_limit_failures = 0
-        self._route_rate_limit_failures = 0
-        self._routes_next_refresh = 0.0
-        self._route_cache: dict[str, tuple[tuple[str, ...], tuple[str, ...]]] = {}
+        self._rate_limit_failures = 0
 
     def invalidate_token(self) -> None:
         """Discard a cached access token."""
@@ -278,9 +279,7 @@ class TailscaleTrustClient:
         async with response:
             if response.status == 429:
                 raise TailscaleTrustRateLimitError(
-                    self._rate_limit_delay(
-                        self._retry_after_header(response), routes=False
-                    )
+                    self._rate_limit_delay(self._retry_after_header(response))
                 )
             if response.status == 400:
                 try:
@@ -364,53 +363,22 @@ class TailscaleTrustClient:
             return None
         return min(RATE_LIMIT_MAX_RETRY, max(1.0, delay))
 
-    def _rate_limit_delay(self, value: str | None, *, routes: bool) -> float:
+    def _rate_limit_delay(self, value: str | None) -> float:
         """Return a bounded server delay or jittered exponential fallback."""
         if parsed := self._parse_retry_after(value):
             return parsed
 
-        if routes:
-            self._route_rate_limit_failures += 1
-            failures = self._route_rate_limit_failures
-        else:
-            self._device_rate_limit_failures += 1
-            failures = self._device_rate_limit_failures
+        self._rate_limit_failures += 1
 
         base = min(
             RATE_LIMIT_MAX_RETRY,
-            RATE_LIMIT_DEFAULT_RETRY * (2 ** min(failures - 1, 4)),
+            RATE_LIMIT_DEFAULT_RETRY * (2 ** min(self._rate_limit_failures - 1, 4)),
         )
         jitter = 0.8 + (0.4 * min(1.0, max(0.0, self._random_value())))
         return min(RATE_LIMIT_MAX_RETRY, max(1.0, base * jitter))
 
-    def _apply_route_cache(self, devices: dict[str, TailscaleDevice]) -> None:
-        """Apply the latest successful route state to freshly listed devices."""
-        for node_id, device in devices.items():
-            if cached := self._route_cache.get(node_id):
-                devices[node_id] = replace(
-                    device,
-                    advertised_routes=cached[0],
-                    enabled_routes=cached[1],
-                    routes_available=True,
-                )
-
-    async def _async_route_requests(
-        self, token: str, node_ids: tuple[str, ...]
-    ) -> list[tuple[str, int, Any, str | None]]:
-        """Read routes in bounded batches and stop on a global API failure."""
-        results: list[tuple[str, int, Any, str | None]] = []
-        for start in range(0, len(node_ids), ROUTE_REQUEST_CONCURRENCY):
-            batch = node_ids[start : start + ROUTE_REQUEST_CONCURRENCY]
-            batch_results = await asyncio.gather(
-                *(self._async_routes_request(token, node_id) for node_id in batch)
-            )
-            results.extend(batch_results)
-            if any(status in {401, 403, 429} for _, status, _, _ in batch_results):
-                break
-        return results
-
     async def async_list_devices(self) -> dict[str, TailscaleDevice]:
-        """List devices and routes, retrying once after an authentication failure."""
+        """List all device fields, retrying once after an authentication failure."""
         for attempt in range(2):
             token = await self._async_token(force=attempt == 1)
             status, payload, retry_after = await self._async_devices_request(token)
@@ -426,9 +394,7 @@ class TailscaleTrustClient:
                     f"OAuth client must grant {OAUTH_SCOPE} for this tailnet"
                 )
             if status == 429:
-                raise TailscaleTrustRateLimitError(
-                    self._rate_limit_delay(retry_after, routes=False)
-                )
+                raise TailscaleTrustRateLimitError(self._rate_limit_delay(retry_after))
             if status >= 400:
                 raise TailscaleTrustConnectionError(
                     f"Devices endpoint returned HTTP {status}"
@@ -455,71 +421,7 @@ class TailscaleTrustClient:
                 raise TailscaleTrustConnectionError(
                     "Devices endpoint returned no usable device identifiers"
                 )
-            self._device_rate_limit_failures = 0
-            self._apply_route_cache(devices)
-
-            if self._monotonic() < self._routes_next_refresh:
-                return devices
-
-            route_results = await self._async_route_requests(token, tuple(devices))
-            if any(status == 401 for _, status, _, _ in route_results):
-                if attempt == 0:
-                    self.invalidate_token()
-                    continue
-                raise TailscaleTrustAuthenticationError(
-                    "Tailscale rejected refreshed OAuth credentials"
-                )
-
-            route_rate_limit_headers = [
-                retry_header
-                for _, route_status, _, retry_header in route_results
-                if route_status == 429
-            ]
-            parsed_route_delays = [
-                delay
-                for retry_header in route_rate_limit_headers
-                if (delay := self._parse_retry_after(retry_header)) is not None
-            ]
-            route_retry_after = (
-                max(parsed_route_delays)
-                if parsed_route_delays
-                else (
-                    self._rate_limit_delay(None, routes=True)
-                    if route_rate_limit_headers
-                    else 0.0
-                )
-            )
-            for node_id, route_status, route_payload, _retry_header in route_results:
-                if route_status == 403:
-                    raise TailscaleTrustPermissionError(
-                        f"OAuth client must grant {OAUTH_SCOPE} for this tailnet"
-                    )
-                if route_status == 404:
-                    # The device may have been removed between the list and route calls.
-                    continue
-                if route_status == 429:
-                    continue
-                if route_status >= 400:
-                    continue
-                if not isinstance(route_payload, Mapping):
-                    continue
-                advertised_routes = _string_tuple(route_payload.get("advertisedRoutes"))
-                enabled_routes = _string_tuple(route_payload.get("enabledRoutes"))
-                self._route_cache[node_id] = (advertised_routes, enabled_routes)
-                devices[node_id] = replace(
-                    devices[node_id],
-                    advertised_routes=advertised_routes,
-                    enabled_routes=enabled_routes,
-                    routes_available=True,
-                )
-
-            if route_retry_after:
-                self._routes_next_refresh = self._monotonic() + route_retry_after
-            else:
-                self._route_rate_limit_failures = 0
-                self._routes_next_refresh = (
-                    self._monotonic() + ROUTE_SCAN_INTERVAL.total_seconds()
-                )
+            self._rate_limit_failures = 0
             return devices
 
         raise AssertionError("Unreachable authentication retry state")
@@ -546,30 +448,3 @@ class TailscaleTrustClient:
                 raise TailscaleTrustConnectionError(
                     "Devices endpoint returned invalid JSON"
                 ) from err
-
-    async def _async_routes_request(
-        self, token: str, node_id: str
-    ) -> tuple[str, int, Any, str | None]:
-        """Perform one authenticated read-only device-routes request."""
-        url = f"{self._api_base_url}/device/{quote(node_id, safe='')}/routes"
-        try:
-            response = await self._session.get(
-                url,
-                headers={"Authorization": f"Bearer {token}"},
-                timeout=REQUEST_TIMEOUT,
-            )
-        except (ClientError, TimeoutError):
-            return node_id, 0, None, None
-
-        async with response:
-            if response.status >= 400:
-                return (
-                    node_id,
-                    response.status,
-                    None,
-                    self._retry_after_header(response),
-                )
-            try:
-                return node_id, response.status, await response.json(), None
-            except (ClientError, ValueError, TypeError):
-                return node_id, response.status, None, None

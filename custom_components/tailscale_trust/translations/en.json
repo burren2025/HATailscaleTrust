@@ -6,13 +6,13 @@
     },
     "error": {
       "cannot_connect": "Failed to connect to Tailscale",
-      "insufficient_scope": "The OAuth client must have devices:core:read and devices:routes:read access",
+      "insufficient_scope": "The OAuth client must have devices:core:read access",
       "invalid_auth": "The OAuth client ID or secret is invalid or revoked"
     },
     "step": {
       "user": {
         "title": "Connect a Tailscale tailnet",
-        "description": "Create a read-only OAuth client on the [Trust credentials page]({trust_credentials_url}) with **Devices > Core: Read** (`devices:core:read`) and **Devices > Routes: Read** (`devices:routes:read`).",
+        "description": "Create a read-only OAuth client on the [Trust credentials page]({trust_credentials_url}) with only **Devices > Core: Read** (`devices:core:read`).",
         "data": {
           "tailnet": "Tailnet identifier",
           "client_id": "OAuth client ID",
